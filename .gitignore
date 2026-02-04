@@ -1,0 +1,9 @@
+*.o
+ray
+
+learning_result/**/*.txt
+learning_result/**/*.log
+sim_params/*.txt
+uct_params/*.txt
+html
+latex
