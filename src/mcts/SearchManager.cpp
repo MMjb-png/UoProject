@@ -591,10 +591,25 @@ IsTimeOver( void )
  * @brief 探索回数制限の確認
  * @return 探索回数制限超過フラグ
  */
+// src/mcts/SearchManager.cpp
+
 bool
 IsSearchContinue( void )
 {
-  return po_info.count < po_info.halt;
+  // 1. プレイアウト回数の上限に達したら終了
+  if (po_info.count >= po_info.halt) return false;
+
+  // 2. 中断フラグが立っていたら終了 (GTPのinterruptなど)
+  if (interruption_flag) return false;
+
+  // 3. 【重要】時間固定モードなどの場合、時間切れ（10秒経過）なら終了する
+  if (search_setting == SearchTimeStrategy::ConstantTimeMode ||
+      search_setting == SearchTimeStrategy::TimeControlMode ||
+      search_setting == SearchTimeStrategy::TimeControlWithByoYomiMode) {
+    if (IsTimeOver()) return false; 
+  }
+
+  return true;
 }
 
 

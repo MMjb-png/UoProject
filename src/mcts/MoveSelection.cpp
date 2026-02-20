@@ -7,7 +7,7 @@
  * @brief 着手選択処理
  */
 #include <iostream>
-
+#include <iomanip>
 #include "common/Message.hpp"
 #include "feature/Territory.hpp"
 #include "mcts/MoveSelection.hpp"
@@ -96,62 +96,52 @@ SelectMaxVisitChild( const uct_node_t &root )
 }
 
 
-/**
- * @~english
- * @brief Select move from search result.
- * @param[in] game Board position data.
- * @param[in] root Root node.
- * @param[in] color Player's color.
- * @param[out] best_wp Best winning percentage of Monte-Carlo simulation.
- * @return Next move.
- * @~japanese
- * @brief 探索の結果から着手を選択
- * @param[in] game 局面情報
- * @param[in] root ルート
- * @param[in] color 手番の色
- * @param[out] best_wp シミュレーション勝率の最大値
- * @return 次の着手
- */
 int
 SelectMove( const game_info_t *game, const uct_node_t &root, const int color, double &best_wp )
 {
   const child_node_t *child = root.child;
   const int select_index = SelectMaxVisitChild(root);
+  // パスの評価値を計算
   const double pass_wp = CalculatePassWinningPercentage(root);
-  statistic_t statistic[BOARD_MAX];
+  
+  // 最善手の勝率を計算
+  best_wp = (child[select_index].move_count > 0) 
+            ? static_cast<double>(child[select_index].win) / child[select_index].move_count 
+            : 0.0;
 
-  CopyStatistic(statistic);
+  // --- デバッグ比較出力 ---
+  std::cerr << "--- Move Selection Decision ---" << std::endl;
+  std::cerr << " Best Move WP: " << std::fixed << std::setprecision(4) << best_wp << std::endl;
+  std::cerr << " Pass WP     : " << pass_wp << std::endl;
+  std::cerr << "-------------------------------" << std::endl;
 
-  best_wp = static_cast<double>(child[select_index].win) / child[select_index].move_count;
-
-  if (best_wp < resign_threshold) {
+  // 1. 投了判定
+  if (best_wp < resign_threshold && game->moves > 20) {
     return RESIGN;
-  } else if (game->moves >= MAX_MOVES) {
-    return PASS;
-  } else if (capture_all_mode) {
-    if (child[select_index].pos == PASS &&
-        IsRemainingDeadStone(game, color, statistic)) {
-      int index = 1, max_count = child[index].move_count;
-      for (int i = 2; i < root.child_num; i++) {
-        if (child[i].move_count > max_count) {
-          index = i;
-          max_count = child[i].move_count;
-        }
-      }
-      return child[index].pos;
-    } else {
-      return child[select_index].pos;
-    }
-  } else {
-    if (pass_wp >= PASS_THRESHOLD &&
-        (game->record[game->moves - 1].pos == PASS)) {
-      return PASS;
-    } else if (game->moves > 3 &&
-               game->record[game->moves - 1].pos == PASS &&
-               game->record[game->moves - 3].pos == PASS) {
-      return PASS;
-    } else {
-      return child[select_index].pos;
-    }
   }
+
+  // 2. 手数上限
+  if (game->moves >= MAX_MOVES) return PASS;
+
+  // 3. パス判定の修正
+  // 序盤（moves < 10）は、pass_wpがどれだけ高くても強制的に盤上に打たせる
+  if (game->moves < 10) {
+      if (child[select_index].pos == PASS && root.child_num > 1) {
+          // パスが最大訪問数でも、2番目に訪問数が多い手（盤上の手）を探す
+          int second_index = (select_index == 0) ? 1 : 0;
+          return child[second_index].pos;
+      }
+      return child[select_index].pos;
+  }
+
+  // 4. Ray本来の終局ロジック
+  if (pass_wp >= PASS_THRESHOLD && (game->record[game->moves - 1].pos == PASS)) {
+    return PASS;
+  } else if (game->moves > 3 &&
+             game->record[game->moves - 1].pos == PASS &&
+             game->record[game->moves - 3].pos == PASS) {
+    return PASS;
+  }
+
+  return child[select_index].pos;
 }

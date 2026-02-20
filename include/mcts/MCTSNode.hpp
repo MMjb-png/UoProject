@@ -94,7 +94,7 @@ struct child_node_t {
    * @~japanese
    * @brief モンテカルロ・シミュレーションの勝った回数
    */
-  std::atomic<int> win;
+  std::atomic<double> win;
 
   /**
    * @~english
@@ -135,6 +135,8 @@ struct child_node_t {
    * @brief シチョウで逃げる手のフラグ
    */
   bool ladder;
+
+  double nn_policy;
 };
 
 
@@ -176,7 +178,7 @@ struct uct_node_t {
    * @~japanese
    * @brief モンテカルロ・シミュレーションの勝った回数
    */
-  std::atomic<int> win;
+  std::atomic<double> win;
 
   /**
    * @~english
@@ -233,7 +235,7 @@ void InitializeCandidate( child_node_t &child, int &child_num, const int pos, co
 
 void AddVirtualLoss( uct_node_t &node, child_node_t &child );
 
-void UpdateResult( uct_node_t &node, child_node_t &child, const int result );
+void UpdateResult( uct_node_t &node, child_node_t &child, double result );
 
 void ReuseRootCandidateWithoutLadderMove( uct_node_t &node, const bool ladder[] );
 

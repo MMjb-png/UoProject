@@ -101,15 +101,41 @@ AddVirtualLoss( uct_node_t &node, child_node_t &child )
  * @param[in] result 探索結果
  */
 void
-UpdateResult( uct_node_t &node, child_node_t &child, const int result )
+UpdateResult(uct_node_t &node, child_node_t &child, double result)
 {
-  node.win += result;
-  node.move_count++;
-  node.virtual_loss--;
+    // 1. node.win のアトミックな更新 (CASループ)
+    {
+        double old_val = node.win.load(std::memory_order_relaxed);
+        double new_val;
+        do {
+            new_val = old_val + result;
+        } while (!node.win.compare_exchange_weak(old_val, new_val, 
+                                                std::memory_order_release, 
+                                                std::memory_order_relaxed));
+    }
+    
+    // 2. node.move_count の更新
+    node.move_count++;
+    
+    // 3. node.virtual_loss の解除
+    node.virtual_loss--;
 
-  child.win += result;
-  child.move_count++;
-  child.virtual_loss--;
+    // 4. child.win のアトミックな更新 (CASループ)
+    {
+        double old_val = child.win.load(std::memory_order_relaxed);
+        double new_val;
+        do {
+            new_val = old_val + result;
+        } while (!child.win.compare_exchange_weak(old_val, new_val, 
+                                                 std::memory_order_release, 
+                                                 std::memory_order_relaxed));
+    }
+    
+    // 5. child.move_count の更新
+    child.move_count++;
+    
+    // 6. child.virtual_loss の解除
+    child.virtual_loss--;
 }
 
 
@@ -126,24 +152,38 @@ UpdateResult( uct_node_t &node, child_node_t &child, const int result )
 void
 ReuseRootCandidateWithoutLadderMove( uct_node_t &node, const bool ladder[] )
 {
-  const int child_num = node.child_num;
-  child_node_t *child = node.child;
+    const int child_num = node.child_num;
+    child_node_t *child = node.child;
 
-  for (int i = 0; i < child_num; i++) {
-    const int pos = child[i].pos;
+    for (int i = 0; i < child_num; i++) {
+        const int pos = child[i].pos;
 
-    child[i].rate = 0.0;
-    child[i].pw = false;
-    child[i].open = false;
-    if (ladder[pos]) {
-      node.move_count -= child[i].move_count;
-      node.win -= child[i].win;
-      child[i].move_count = 0;
-      child[i].win = 0;
+        child[i].rate = 0.0;
+        child[i].pw = false;
+        child[i].open = false;
+        
+        if (ladder[pos]) {
+            // --- 統計情報の差し引き ---
+            int child_move_count = child[i].move_count.exchange(0);
+            double child_win = child[i].win.exchange(0.0);
+
+            // 1. node.move_count の更新 (int型ならそのまま演算可能)
+            node.move_count -= child_move_count;
+
+            // 2. node.win のアトミックな減算 (CASループ)
+            {
+                double old_val = node.win.load(std::memory_order_relaxed);
+                double new_val;
+                do {
+                    new_val = old_val - child_win;
+                } while (!node.win.compare_exchange_weak(old_val, new_val,
+                                                        std::memory_order_release,
+                                                        std::memory_order_relaxed));
+            }
+        }
+
+        child[i].ladder = ladder[pos];
     }
-
-    child[i].ladder = ladder[pos];
-  }
 }
 
 
