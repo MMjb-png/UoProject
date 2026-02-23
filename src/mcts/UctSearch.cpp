@@ -32,6 +32,7 @@
 
 #include "board/DynamicKomi.hpp"
 #include "board/GoBoard.hpp"
+#include "board/Point.hpp"
 #include "common/Message.hpp"
 #include "pattern/PatternHash.hpp"
 #include "feature/Ladder.hpp"
@@ -508,6 +509,8 @@ StopPondering( void )
   }
 }
 
+extern void InitializeUctSearch(void);
+
 /**
  * @brief 思考エンジン本体（メインループ）
  * @param[in] game 現在の局面
@@ -515,94 +518,139 @@ StopPondering( void )
  * @return 選択された着手（pos）
  */
 int
-UctSearchGenmove( game_info_t *game, int color, int mode )
+UctSearchGenmove(game_info_t *game, int color, int mode)
 {
-  // 1. 探索設定の取得 (Rayの既存変数を使用)
-  // config等で設定されているプレイアウト数。const_playout 等が一般的
-  int po_limit = 1000; 
-  
-  // threads がエラーになる場合は、ここも一旦 1 または 4 などの定数にしてください
-  int thread_num = static_cast<int>(threads); 
-  if (thread_num <= 0) thread_num = 1;
+    // --- 1. ルートノード(0番)およびツリーのリセット ---
+    // メモリ再確保を避けるため、InitializeUctSearch()は呼ばず最小限のリセットを行う
+    int root = 0;
+    uct_node[root].child_num = 0; 
+    uct_node[root].move_count = 0;
 
-  int root = 0;
-
-  // 探索状況のリセット
-  ResetPoCount();
-  interrupted = false;
-
-  // ルートノードが未展開なら、最初の評価をメインスレッドで行う
-  if (uct_node[root].child_num == 0) {
-    at::Tensor input = TamaGoFeature::GenerateInputPlanes(game, color);
-    std::vector<torch::jit::IValue> inputs;
-    inputs.push_back(input.to(device));
-    auto outputs = tamago_model.forward(inputs).toTuple();
-    // 安全な書き方例
-    auto policy = outputs->elements()[0].toTensor().softmax(1).to(torch::kCPU).view({-1});
-    ExpandNode(game, color, root, policy);
-  }
-
-  // 2. ワーカースレッドの起動
-  std::vector<std::thread> workers;
-  for (int i = 0; i < thread_num; i++) {
-    workers.emplace_back([&]() {
-      // スレッドごとに乱数生成器を初期化
-      std::mt19937_64 mt(std::random_device{}());
-      
-      while (GetPoCount() < po_limit && !interrupted) {
-        game_info_t *copy_game = AllocateGame();
-        CopyGame(copy_game, game);
-        
-        // TamaGo再現：探索経路を記録するためのvector
-        std::vector<std::pair<int, int>> path;
-        
-        // 探索実行（第5引数に path を渡す）
-        UctSearch(copy_game, color, mt, root, path);
-        
-        FreeGame(copy_game);
-        // Rayの既存のカウントアップ関数
-        IncrementPoCount();
-      }
-    });
-  }
-
-  // 3. メインスレッドによるミニバッチ推論ループ
-  // ワーカースレッドが push したリクエストをここでまとめて処理する
-  while (GetPoCount() < po_limit && !interrupted) {
-    if (g_batch_queue.size() > 0) {
-      // BatchHandler.cpp の推論実行関数
-      ProcessMiniBatch(tamago_model, device);
-    } else {
-      // CPU負荷を抑えつつバッチが溜まるのを待つ
-      std::this_thread::yield();
+    // Ray内部定数 pure_board_max を使用（環境により board_max 等へ変更）
+    for (int j = 0; j < pure_board_max; j++) {
+        uct_node[root].child[j].index = NOT_EXPANDED;
+        uct_node[root].child[j].move_count = 0;
+        uct_node[root].child[j].win = 0.0;
+        uct_node[root].child[j].virtual_loss = 0;
     }
 
-    // 時間制限のチェック (SearchManager.cpp等に定義されている想定)
-    // Rayの既存のタイマーチェック関数があればここに挿入
-  }
+    // ハッシュテーブルのクリア（盤面とノードの紐付けをリセット）
+    ClearUctHash();
 
-  // 全スレッドの終了を待機
-  for (auto &t : workers) {
-    if (t.joinable()) t.join();
-  }
+    // 探索設定
+    int po_limit = 1000; 
+    int thread_num = static_cast<int>(threads); 
+    if (thread_num <= 0) thread_num = 1;
 
-  // 4. 最終的な着手選択 (MoveSelection.cpp)
-  double best_wp = 0.0;
-  // エラー対策：root(int)ではなく、uct_node[root] (uct_node_t&) を渡す
-  int select_pos = SelectMove(game, uct_node[root], color, best_wp);
+    ResetPoCount();
+    interrupted = false;
 
-  return select_pos;
+    // --- 2. ルート展開 (初回の評価) ---
+    // ルートが未展開の場合、スレッド起動前にNNで評価しておく
+    if (uct_node[root].child_num == 0) {
+        at::Tensor input = TamaGoFeature::GenerateInputPlanes(game, color);
+        std::vector<torch::jit::IValue> inputs;
+        inputs.push_back(input.to(device));
+        auto outputs = tamago_model.forward(inputs).toTuple();
+        auto policy = outputs->elements()[0].toTensor().softmax(1).to(torch::kCPU).view({-1});
+        ExpandNode(game, color, root, policy);
+        fprintf(stderr, "DEBUG: Root Expanded. Moves: %d\n", uct_node[root].child_num);
+    }
+
+    // --- 3. ワーカースレッドの起動 ---
+    std::vector<std::thread> workers;
+    for (int i = 0; i < thread_num; i++) {
+        workers.emplace_back([&, i]() {
+            fprintf(stderr, "DEBUG: [Worker %d] Started.\n", i);
+            std::mt19937_64 mt(std::random_device{}());
+            
+            while (GetPoCount() < po_limit && !interrupted) {
+                game_info_t *copy_game = AllocateGame();
+                CopyGame(copy_game, game);
+                
+                std::vector<std::pair<int, int>> path;
+                
+                // 探索実行（内部でキューに積まれる場合は path に記録される想定）
+                UctSearch(copy_game, color, mt, root, path);
+                
+                // UctSearch 内で copy_game を FreeGame しない実装の場合、ここで解放
+                FreeGame(copy_game);
+                IncrementPoCount();
+            }
+            fprintf(stderr, "DEBUG: [Worker %d] Finished.\n", i);
+        });
+    }
+
+    // --- 4. メインスレッドによるミニバッチ推論ループ ---
+    fprintf(stderr, "DEBUG: [Main] Loop Start. Target PO: %d\n", po_limit);
+
+    // GetPoCount() だけでなく、全スレッドがリクエストを出し切るまで回す
+    while (GetPoCount() < po_limit && !interrupted) {
+        if (g_batch_queue.size() > 0) {
+            // 推論実行
+            ProcessMiniBatch(tamago_model, device);
+            // ログの頻度を抑える
+            static int batch_tick = 0;
+            if (++batch_tick % 10 == 0) {
+                fprintf(stderr, "DEBUG: [Main] Processed Batch. Current PO: %d\n", GetPoCount());
+            }
+        } else {
+            // リクエストがない間は CPU を明け渡す
+            std::this_thread::yield();
+        }
+    }
+    fprintf(stderr, "DEBUG: [Main] Loop Finished.\n");
+
+    // --- 5. 終了処理 ---
+    // interrupted を true にしてワーカースレッドに終了を促す
+    interrupted = true; 
+    for (auto &t : workers) {
+        if (t.joinable()) t.join();
+    }
+
+    // 残っている推論リクエストを全て処理
+    while (g_batch_queue.size() > 0) {
+        ProcessMiniBatch(tamago_model, device);
+    }
+
+    // --- 6. 結果の集計と着手選択 ---
+    double best_wp = 0.0;
+    
+    fprintf(stderr, "--- Root Node Stats ---\n");
+    for (int i = 0; i < uct_node[root].child_num; ++i) {
+        auto& c = uct_node[root].child[i];
+        if (c.move_count > 0) {
+            double wp = (double)c.win / c.move_count;
+            fprintf(stderr, "pos=%3d n=%4d win=%7.2f wp=%.4f\n", 
+                    c.pos, (int)c.move_count, (double)c.win, wp);
+        }
+    }
+
+    // SelectMove は Ray の標準的なもの、あるいは自作のものを呼び出し
+    int select_pos = SelectMove(game, uct_node[root], color, best_wp);
+
+    fprintf(stderr, "-----------------------\n");
+    fprintf(stderr, "SELECTED MOVE: %d with WP: %.4f\n", select_pos, best_wp);
+
+    return select_pos;
 }
 
 void UpdateNodeStats(int current, int child_index, double v) {
-    // 訪問回数の更新（Atomic）
+    // 子ノードの統計更新
     uct_node[current].child[child_index].move_count.fetch_add(1);
-    uct_node[current].move_count.fetch_add(1);
+    
+    // win (double) のAtomic加算
+    auto& atomic_child_win = reinterpret_cast<std::atomic<double>&>(uct_node[current].child[child_index].win);
+    double old_child_win = atomic_child_win.load();
+    while (!atomic_child_win.compare_exchange_weak(old_child_win, old_child_win + v));
 
-    // 勝利数（win）の更新（Atomicな加算が必要）
-    auto& atomic_win = reinterpret_cast<std::atomic<double>&>(uct_node[current].child[child_index].win);
-    double old_win = atomic_win.load();
-    while (!atomic_win.compare_exchange_weak(old_win, old_win + v));
+    // 親ノード（自分）の統計更新
+    uct_node[current].move_count.fetch_add(1);
+    
+    // 親ノードの win には 1.0 - v を加算する場合が多い（視点の反転）
+    auto& atomic_node_win = reinterpret_cast<std::atomic<double>&>(uct_node[current].win);
+    double old_node_win = atomic_node_win.load();
+    while (!atomic_node_win.compare_exchange_weak(old_node_win, old_node_win + (1.0 - v)));
 }
 
 #include <iostream>
@@ -612,11 +660,23 @@ void UpdateNodeStats(int current, int child_index, double v) {
 
 // NNのPolicy(0-81)をRayの座標(1次元インデックス)に変換するテーブル
 // ※初期化時に一度だけ作成するか、ループ内で計算します。
+// NNの0-80をRayの内部座標(int)に変換する
 static int NNIdxToRayPos(int nn_idx, int bsize) {
-    if (nn_idx == 81) return PASS; // PASS
-    int x = (nn_idx % bsize) + 1;  // 番兵分 +1
-    int y = (nn_idx / bsize) + 1;  // 番兵分 +1
-    return POS(x, y);
+    if (nn_idx == bsize * bsize) return PASS;
+
+    char tmp_pos[10];
+    // x方向: 'I' を飛ばす囲碁の慣習に対応したテーブル (gogui_x は 'A','B',...,'H','J',...)
+    // nn_idx % 9 = 0 -> 'A', 1 -> 'B', ...
+    char x_char = gogui_x[(nn_idx % bsize) + 1]; 
+    
+    // y方向: NNの 0-8 行目を 1-9 行目に変換 (上が 9, 下が 1)
+    // NNの nn_idx / 9 = 0 が「一番上の行(9)」を指している場合
+    int y_num = bsize - (nn_idx / bsize);
+    
+    sprintf(tmp_pos, "%c%d", x_char, y_num);
+    
+    // Ray 本来のロジックで数値座標に変換
+    return StringToInteger(tmp_pos);
 }
 
 enum UCT_RESULT {
@@ -805,6 +865,9 @@ ExpandRoot(game_info_t *game, int color)
  * @param[in] policy_tensor TamaGoの推論結果（Policyヘッドの出力）
  * @return 展開されたノードのインデックス
  */
+/**
+ * @brief NNの推論結果（Policy）を用いて、新しいUCTノードを展開する
+ */
 static int
 ExpandNode(game_info_t *game, int color, int current, torch::Tensor policy_tensor)
 {
@@ -813,85 +876,90 @@ ExpandNode(game_info_t *game, int color, int current, torch::Tensor policy_tenso
     unsigned int index = FindSameHashIndex(hash, color, moves);
     int pm1 = PASS, pm2 = PASS;
     
-    // 1. 合流先（既存ノード）が検知できれば、それを返す
-    if (index != uct_hash_size) {
-        return index;
-    }
+    if (index != uct_hash_size) return (int)index;
 
-    // 2. 空のインデックスを探してノードを確保
     index = SearchEmptyIndex(hash, color, moves);
-    assert(index != uct_hash_size);    
+    if (index == uct_hash_size) return -1;
 
-    // 直前の着手履歴の取得
-    pm1 = game->record[moves - 1].pos;
+    if (moves > 0) pm1 = game->record[moves - 1].pos;
     if (moves > 1) pm2 = game->record[moves - 2].pos;
 
-    // 新しいノードの初期化
     InitializeNode(uct_node[index], pm1, pm2);
 
     child_node_t *uct_child = uct_node[index].child;
     int child_num = 0;
 
-    // --- Policyデータのアクセサ作成 ---
-    // policy_tensorは [82] (0-80: 盤上, 81: パス)
-    auto policy_flat = policy_tensor.view({-1});
-    auto p_acc = policy_flat.accessor<float, 1>();
+    // --- NN Policyデータの取得 ---
+    auto policy_cpu = policy_tensor.to(torch::kCPU);
+    float* p_ptr = policy_cpu.data_ptr<float>();
 
-    // --- 3. 盤上の候補手の展開 (先に実行) ---
-    // onboard_pos[i] を使うことで、モデルの 9x9 インデックス i と Rayの座標 pos を紐付ける
-    for (int i = 0; i < pure_board_max; i++) {
-        const int pos = onboard_pos[i];
-        
-        // 合法手のみを展開
-        if (IsLegal(game, pos, color)) { 
-            InitializeCandidate(uct_child[child_num], child_num, pos, false);
-            
-            // モデルが出力した i 番目の確率をセット
-            uct_child[child_num].nn_policy = (float)p_acc[i];
-            
-            child_num++;
+    // 3. 盤上の候補手の展開 (0-80)
+    for (int i = 0; i < 81; i++) {
+        // TamaGo index (0-80) -> x, y (1-9)
+        // TamaGoは左上(0,0)をインデックス0とする
+        int x = (i % 9) + 1;
+        int y = (i / 9) + 1;
+
+        // Ray内部座標系への変換
+        // OB_SIZEを含めた正しいオフセット計算
+        int ray_pos = POS(x + OB_SIZE - 1, y + OB_SIZE - 1);
+
+        if (i == 0) { // ループの最初だけでOK
+            int stones = 0;
+            for (int p = 0; p < BOARD_MAX; p++) {
+                if (game->board[p] == S_BLACK || game->board[p] == S_WHITE) stones++;
+            }
+            std::cerr << "DEBUG: ExpandNode - Current board stones: " << stones << std::endl;
         }
+
+        if (IsLegal(game, ray_pos, color)) {
+            InitializeCandidate(uct_child[child_num], child_num, ray_pos, false);
+            uct_child[child_num].nn_policy = p_ptr[i]; 
+        } 
+        /* // もしこれでも直らない場合、以下のコメントを外してビルドしてください
+        else if (p_ptr[i] > 0.01) {
+            std::cerr << "Illegal Move: i=" << i << " x=" << x << " y=" << y << " pos=" << ray_pos << std::endl;
+        }
+        */
     }
 
-    // --- 4. パスノードの展開 (最後に追加) ---
-    // 盤上の手を優先させるため、リストの最後に配置する
-    InitializeCandidate(uct_child[child_num], child_num, PASS, false);
-    // 9x9モデルの場合、インデックス 81 (pure_board_max) がパス
-    uct_child[child_num].nn_policy = (float)p_acc[pure_board_max]; 
-    child_num++;
+    // 4. パスの展開 (TamaGo index 81)
+    if (IsLegal(game, PASS, color)) {
+        InitializeCandidate(uct_child[child_num], child_num, PASS, false);
+        uct_child[child_num].nn_policy = p_ptr[81]; 
+    }
 
-    // 有効な着手数をノードにセット
     uct_node[index].child_num = child_num;
-
-    // 5. その他ノード情報のセット
     CheckSeki(game, uct_node[index].seki);
     uct_node[index].width = 1;
 
-    // --- 6. 兄弟ノードからの知識継承 (Ray既存ロジック) ---
-    const int sibling_num = uct_node[current].child_num;
-    child_node_t *uct_sibling = uct_node[current].child;
-    double max_rate = 0.0;
-    int max_pos = PASS;
+    // 6. 知識継承
+    if (current >= 0 && current < (int)uct_hash_size) {
+        const int sibling_num = uct_node[current].child_num;
+        child_node_t *uct_sibling = uct_node[current].child;
+        double max_rate = -1.0;
+        int max_pos = PASS;
 
-    for (int i = 0; i < sibling_num; i++) {
-        if (uct_sibling[i].pos != pm1) {
-            if (uct_sibling[i].rate > max_rate) {
-                max_rate = uct_sibling[i].rate;
-                max_pos = uct_sibling[i].pos;
+        for (int i = 0; i < sibling_num; i++) {
+            if (uct_sibling[i].pos != pm1) {
+                if (uct_sibling[i].rate > max_rate) {
+                    max_rate = uct_sibling[i].rate;
+                    max_pos = uct_sibling[i].pos;
+                }
+            }
+        }
+
+        if (max_pos != PASS) {
+            for (int i = 0; i < uct_node[index].child_num; i++) {
+                if (uct_child[i].pos == max_pos) {
+                    if (!uct_child[i].pw) uct_child[i].open = true;
+                    break;
+                }
             }
         }
     }
 
-    for (int i = 0; i < child_num; i++) {
-        if (uct_child[i].pos == max_pos) {
-            if (!uct_child[i].pw) {
-                uct_child[i].open = true;
-            }
-            break;
-        }
-    }
-
-    return index;
+    return (int)index;
 }
 
 /**
@@ -1218,51 +1286,68 @@ ParallelUctSearchPondering( thread_arg_t *arg )
  * @return 探索結果の勝率
  */
 static double
-UctSearch( game_info_t *game, int color, std::mt19937_64 &mt, int current, std::vector<std::pair<int, int>> &path )
+UctSearch(game_info_t *game, int color, std::mt19937_64 &mt, int current, std::vector<std::pair<int, int>> &path)
 {
-  bool is_game_over = (game->moves > 1 && 
-                      game->record[game->moves - 1].pos == PASS && 
-                      game->record[game->moves - 2].pos == PASS);
+    // 1. 終局判定
+    bool is_game_over = (game->moves > 1 && 
+                         game->record[game->moves - 1].pos == PASS && 
+                         game->record[game->moves - 2].pos == PASS);
 
-  if (game->moves >= MAX_MOVES || is_game_over) {
-      // EstimateScore の代わり。
-      // 勝敗を判定し、自分が勝っていれば 1.0, 負けていれば 0.0 を返す
-      // ※ CalculateScore は Ray の BoardData.hpp 等で定義されている想定
-      return (CalculateScore(game) > 0) ? 1.0 : 0.0;
-  }
+    if (game->moves >= MAX_MOVES || is_game_over) {
+        double score = static_cast<double>(CalculateScore(game));
+        extern double komi[]; 
+        score -= komi[0]; 
 
-  int next_index = SelectMaxUcbChild(uct_node[current], game->moves, color, mt);
-  int pos = uct_node[current].child[next_index].pos;
-  int next_node = uct_node[current].child[next_index].index;
+        if (color == S_BLACK) return (score > 0) ? 1.0 : 0.0;
+        else return (score < 0) ? 1.0 : 0.0;
+    }
 
-  // 経路記録
-  path.push_back({current, next_index});
+    // 2. 次の手を選択（現在のツリー状態からUCBが最大の手を選ぶ）
+    int next_index = SelectMaxUcbChild(uct_node[current], game->moves, color, mt);
+    int pos = uct_node[current].child[next_index].pos;
+    int next_node = uct_node[current].child[next_index].index;
 
-  // --- 修正2: 未展開ノードの場合（ここで探索を止めてBatchに投げる） ---
-  if (next_node == NOT_EXPANDED) {
-    uct_node[current].child[next_index].virtual_loss.fetch_add(1);
+    path.push_back({current, next_index});
 
-    game_info_t *copy_game = AllocateGame();
-    CopyGame(copy_game, game);
-    PutStone(copy_game, pos, color);
+    // 3. 次の局面の作成（元の game を汚さないよう常にコピー）
+    game_info_t *next_game = AllocateGame();
+    CopyGame(next_game, game);
+    if (IsLegal(next_game, pos, color)) {
+        PutStone(next_game, pos, color);
+    }
 
-    // キューイング
-    at::Tensor input_tensor = TamaGoFeature::GenerateInputPlanes(copy_game, 3 - color);
-    g_batch_queue.push(input_tensor, copy_game, path, 3 - color);
+    double v = 0.5;
 
-    return 0.5; // 暫定値。後で BatchHandler が真実の値を上書きする
-  }
+    // --- 【検証用】深さ1で止めるロジック ---
+    if (next_node == NOT_EXPANDED) {
+        // 未展開：NN評価へ回す
+        uct_node[current].child[next_index].virtual_loss.fetch_add(1);
 
-  // --- 修正3: 既に展開済みのノードの場合（Undo処理が必要） ---
-  // Rayの仕様により手を戻せない場合は、ここで常にCopyGameするか、Undo関数を呼ぶ
-  PutStone(game, pos, color);
-  double v = 1.0 - UctSearch(game, 3 - color, mt, next_node, path);
-  // UndoMove(game); // <-- これが非常に重要！盤面を元に戻さないと探索が壊れる
+        // NN入力用テンソル生成
+        at::Tensor input_tensor = TamaGoFeature::GenerateInputPlanes(next_game, 3 - color);
+        
+        // キューに push。これ以降、next_game の所有権は BatchThread(ProcessMiniBatch) に移る。
+        // ※ここでは FreeGame(next_game) は絶対に呼ばない。
+        g_batch_queue.push(input_tensor, next_game, path, 3 - color);
+        
+        v = 0.5; // BatchThread が値を更新するまでの暫定値
+    } 
+    else {
+        // 展開済み：深さ1検証中は再帰せず、既存の統計情報を利用してバックプロパゲーションのテスト
+        if (uct_node[next_node].move_count > 0) {
+            v = 1.0 - (double)uct_node[next_node].win / uct_node[next_node].move_count;
+        } else {
+            v = 0.5;
+        }
 
-  // バーチャルロスを戻し、統計更新
-  UpdateNodeStats(current, next_index, v);
+        // 展開済みの場合は BatchThread に行かないため、ここで確実に解放
+        FreeGame(next_game);
 
-  return v;
+        // 統計情報の更新
+        UpdateNodeStats(current, next_index, v);
+    }
+
+    return v;
 }
 /**
  * @~english
@@ -1306,51 +1391,58 @@ RateComp( const void *a, const void *b )
  * @return 次の手に対応するノードのインデックス
  */
 static int
-SelectMaxUcbChild( int current, int color, std::mt19937_64 &mt )
+SelectMaxUcbChild( uct_node_t &node, const int moves, const int color, std::mt19937_64 &mt )
 {
-    const int child_num = uct_node[current].child_num;
-    const int sum = uct_node[current].move_count; // 全体の訪問回数
-    child_node_t *uct_child = uct_node[current].child;
-    
     int select_index = -1;
-    double max_score = -1e20; // 十分に小さな値
+    double max_score = -1e20;
     
-    // TamaGo (constant.py) の PUCB_SECOND_TERM_WEIGHT = 1.0 に対応
-    const double C_PUCT = 1.0; 
-    const double sqrt_sum = std::sqrt(static_cast<double>(sum));
+    // UCB/PUCT計算用の定数
+    const int total_visits = node.move_count.load();
+    const double sqrt_total = std::sqrt(static_cast<double>(total_visits) + 1.0);
+    const double C_PUCT = 1.0; // 探索定数（必要に応じて調整）
 
-    for (int i = 0; i < child_num; i++) {
-        // --- Virtual Loss を考慮した訪問回数の計算 ---
-        // 実績(move_count)に、現在推論中のスレッド数(virtual_loss)を加算
-        const int n = uct_child[i].move_count.load() + uct_child[i].virtual_loss.load();
+    // デバッグフラグ：ルートノードの最初の数回の探索を詳細に出す
+    static int debug_print_count = 0;
+    bool do_debug = (total_visits < 20); // 合計訪問数が少ない（探索初期）時だけ出力
+
+    for (int i = 0; i < node.child_num; i++) {
+        child_node_t &child = node.child[i];
+        const int n = child.move_count.load() + child.virtual_loss.load();
         
-        double q_value;
+        // 1. Q値 (実績勝率): バックプロパゲーションの結果がここに現れる
+        double q_value = 0.5; // 未訪問時の初期値
         if (n > 0) {
-            // 勝率計算。推論中は分母が大きくなるため、Q値が一時的に下がる
-            q_value = static_cast<double>(uct_child[i].win) / n;
-        } else {
-            // 未訪問の場合は 0.5 (または nn_policy に基づく初期値)
-            q_value = 0.5;
+            q_value = static_cast<double>(child.win) / n;
         }
 
-        // --- PUCT 第2項 (探索の勢い) ---
-        // TamaGoの計算式: p * sqrt(total_visits) / (1 + n)
-        double u_value = C_PUCT * uct_child[i].nn_policy * sqrt_sum / (1.0 + n);
+        // 2. U値 (Policy項): NNの出力(nn_policy)がここに現れる
+        // PUCT公式: C * P * sqrt(Total) / (1 + n)
+        double u_value = C_PUCT * child.nn_policy * sqrt_total / (1.0 + n);
         
         double score = q_value + u_value;
 
-        // 【修正】マジックナンバーによる減算は不要。
-        // 分母 n に virtual_loss が含まれていることで、
-        // 推論中のノードは自然に選択肢から外れ、他の枝(探索)へ分散されます。
+        // 【デバッグログ】
+        if (do_debug && child.nn_policy > 0.001) {
+            char pos_str[10];
+            IntegerToString(child.pos, pos_str);
+            fprintf(stderr, "  DEBUG: pos=%-3s n=%2d q=%.4f p=%.4f score=%.4f\n",
+                    pos_str, n, q_value, child.nn_policy, score);
+        }
 
         if (score > max_score) {
             max_score = score;
             select_index = i;
+        } else if (score == max_score) {
+            // スコアが同じ場合は乱数でタイブレーク
+            if (mt() % 2 == 0) select_index = i;
         }
     }
 
-    // 万が一、有効なインデックスが見つからなかった場合の保険
-    if (select_index == -1) return 0;
+    if (do_debug && select_index != -1) {
+        char best_pos[10];
+        IntegerToString(node.child[select_index].pos, best_pos);
+        fprintf(stderr, "  >> SELECTED: %s (TotalVisits: %d)\n", best_pos, total_visits);
+    }
 
     return select_index;
 }
@@ -1791,46 +1883,37 @@ GetExpandThreshold( const game_info_t *game )
 int ExpandNodeWithNN(game_info_t *game, int color, int current, int child_index, at::Tensor policy) {
     std::lock_guard<std::mutex> lock(mutex_expand);
 
+    // すでに展開済みなら、何もしない（gameはここでは消さない）
     if (uct_node[current].child[child_index].index != NOT_EXPANDED) {
-        FreeGame(game); // 不要になったコピーを解放
         return uct_node[current].child[child_index].index;
     }
 
-    // 正しい局面情報とTensorを渡して展開
     int new_index = ExpandNode(game, color, current, policy); 
-
     uct_node[current].child[child_index].index = new_index;
     
-    FreeGame(game); // 展開が終わったので解放
+    // ここで FreeGame(game) はしない！
     return new_index;
 }
-
 /**
  * @brief NNの推論結果（Value）をルート方向へ報告し、Virtual Lossを解除する
  */
 // 修正案：探索経路（path）を受け取るように変更する必要があります
-void BackpropagateNNResult(int node_index, int child_index, double win_rate) {
-    // もし単純に1つのノードだけを更新する元の仕様なら
-    double v = win_rate;
-    int current = node_index;
+void BackpropagateNNResult(std::vector<std::pair<int, int>> &path, double win_rate) {
+    // パスを逆順に辿って各ノードの勝率を更新する
+    // 深さ1の場合は path[0] だけが対象になる
+    // BackpropagateNNResult 内
+    fprintf(stderr, "NN Result Backpropagated: Value=%.4f, PathSize=%zu\n", win_rate, path.size());
+    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+        int node_idx = it->first;
+        int child_idx = it->second;
 
-    child_node_t &child = uct_node[current].child[child_index];
-    
-    // Virtual Lossの解除
-    child.virtual_loss.fetch_sub(1);
+        // Virtual Lossの解除
+        uct_node[node_idx].child[child_idx].virtual_loss.fetch_sub(1);
 
-    // 実績の更新
-    auto& child_win = reinterpret_cast<std::atomic<double>&>(child.win);
-    double old_win = child_win.load();
-    while (!child_win.compare_exchange_weak(old_win, old_win + v));
-    child.move_count.fetch_add(1);
-
-    // 親の更新
-    auto& node_win = reinterpret_cast<std::atomic<double>&>(uct_node[current].win);
-    double old_node_win = node_win.load();
-    while (!node_win.compare_exchange_weak(old_node_win, old_node_win + v));
-    uct_node[current].move_count.fetch_add(1);
-    
-    // ※本来はここからルートまで遡る必要がありますが、
-    // まずはコンパイルを通すために引数を合わせます。
+        // 真のValueで統計を更新
+        UpdateNodeStats(node_idx, child_idx, win_rate);
+        
+        // 手番が入れ替わるので win_rate を反転
+        win_rate = 1.0 - win_rate;
+    }
 }
