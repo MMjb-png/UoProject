@@ -545,16 +545,20 @@ UctSearchGenmove(game_info_t *game, int color, int mode)
     ResetPoCount();
     interrupted = false;
 
-    // --- 2. ルート展開 (初回の評価) ---
-    // ルートが未展開の場合、スレッド起動前にNNで評価しておく
+    // --- 2. ルート展開 ---
     if (uct_node[root].child_num == 0) {
         at::Tensor input = TamaGoFeature::GenerateInputPlanes(game, color);
         std::vector<torch::jit::IValue> inputs;
         inputs.push_back(input.to(device));
+        
         auto outputs = tamago_model.forward(inputs).toTuple();
         auto policy = outputs->elements()[0].toTensor().softmax(1).to(torch::kCPU).view({-1});
-        ExpandNode(game, color, root, policy);
-        fprintf(stderr, "DEBUG: Root Expanded. Moves: %d\n", uct_node[root].child_num);
+        
+        // ★ここを修正：返り値 (index) を root に代入する
+        root = ExpandNode(game, color, -1, policy); 
+        
+        fprintf(stderr, "DEBUG: Root Expanded. New Root Index: %d, Moves: %d\n", 
+                root, uct_node[root].child_num);
     }
 
     // --- 3. ワーカースレッドの起動 ---
@@ -895,39 +899,41 @@ ExpandNode(game_info_t *game, int color, int current, torch::Tensor policy_tenso
 
     // 3. 盤上の候補手の展開 (0-80)
     for (int i = 0; i < 81; i++) {
-        // TamaGo index (0-80) -> x, y (1-9)
-        // TamaGoは左上(0,0)をインデックス0とする
         int x = (i % 9) + 1;
         int y = (i / 9) + 1;
 
-        // Ray内部座標系への変換
-        // OB_SIZEを含めた正しいオフセット計算
         int ray_pos = POS(x + OB_SIZE - 1, y + OB_SIZE - 1);
 
-        if (i == 0) { // ループの最初だけでOK
+        if (i == 0) { 
             int stones = 0;
             for (int p = 0; p < BOARD_MAX; p++) {
                 if (game->board[p] == S_BLACK || game->board[p] == S_WHITE) stones++;
             }
-            std::cerr << "DEBUG: ExpandNode - Current board stones: " << stones << std::endl;
+            std::cerr << "DEBUG: ExpandNode - Current board stones: " << stones << " color: " << color << std::endl;
         }
 
+        // デバッグ文：特定の座標（例:盤面中央や隅）でIsLegalがどう判定されているか
         if (IsLegal(game, ray_pos, color)) {
             InitializeCandidate(uct_child[child_num], child_num, ray_pos, false);
             uct_child[child_num].nn_policy = p_ptr[i]; 
-        } 
-        /* // もしこれでも直らない場合、以下のコメントを外してビルドしてください
-        else if (p_ptr[i] > 0.01) {
-            std::cerr << "Illegal Move: i=" << i << " x=" << x << " y=" << y << " pos=" << ray_pos << std::endl;
+            // ※ここで child_num++ がないため、現状は上書きされ続けている可能性があります
+        } else {
+            // 合法でないと判定された理由を特定するためのログ（i=40は盤面中央付近）
+            if (i == 40) {
+                std::cerr << "DEBUG_LEGAL: i=40 ray_pos=" << ray_pos 
+                          << " board_val=" << (int)game->board[ray_pos] 
+                          << " IsLegal=false" << std::endl;
+            }
         }
-        */
     }
 
-    // 4. パスの展開 (TamaGo index 81)
     if (IsLegal(game, PASS, color)) {
         InitializeCandidate(uct_child[child_num], child_num, PASS, false);
         uct_child[child_num].nn_policy = p_ptr[81]; 
     }
+
+    // 最終的な child_num の値を確認
+    std::cerr << "DEBUG: ExpandNode Final child_num = " << child_num << std::endl;
 
     uct_node[index].child_num = child_num;
     CheckSeki(game, uct_node[index].seki);
