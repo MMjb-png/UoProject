@@ -93,6 +93,8 @@ struct node_hash_t {
    * @brief 使用の有無のフラグ
    */
   bool flag;
+
+  int node_index;          // ★追加：uct_node配列のインデックス
 };
 
 

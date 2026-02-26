@@ -538,7 +538,7 @@ UctSearchGenmove(game_info_t *game, int color, int mode)
     ClearUctHash();
 
     // 探索設定
-    int po_limit = 1000; 
+    int po_limit = 2000; 
     int thread_num = static_cast<int>(threads); 
     if (thread_num <= 0) thread_num = 1;
 
@@ -640,18 +640,17 @@ UctSearchGenmove(game_info_t *game, int color, int mode)
 }
 
 void UpdateNodeStats(int current, int child_index, double v) {
-    // 子ノードの統計更新
+    // 1. 子ノードの統計更新 (訪問数と勝利数)
     uct_node[current].child[child_index].move_count.fetch_add(1);
     
-    // win (double) のAtomic加算
     auto& atomic_child_win = reinterpret_cast<std::atomic<double>&>(uct_node[current].child[child_index].win);
     double old_child_win = atomic_child_win.load();
     while (!atomic_child_win.compare_exchange_weak(old_child_win, old_child_win + v));
 
-    // 親ノード（自分）の統計更新
+    // 2. 親ノード（自分）の統計更新
+    // 手番が交互に入れ替わるため、親ノードには (1.0 - v) を加算
     uct_node[current].move_count.fetch_add(1);
     
-    // 親ノードの win には 1.0 - v を加算する場合が多い（視点の反転）
     auto& atomic_node_win = reinterpret_cast<std::atomic<double>&>(uct_node[current].win);
     double old_node_win = atomic_node_win.load();
     while (!atomic_node_win.compare_exchange_weak(old_node_win, old_node_win + (1.0 - v)));
@@ -1304,54 +1303,67 @@ UctSearch(game_info_t *game, int color, std::mt19937_64 &mt, int current, std::v
         extern double komi[]; 
         score -= komi[0]; 
 
-        if (color == S_BLACK) return (score > 0) ? 1.0 : 0.0;
-        else return (score < 0) ? 1.0 : 0.0;
+        double result = 0.0;
+        if (color == S_BLACK) result = (score > 0) ? 1.0 : 0.0;
+        else result = (score < 0) ? 1.0 : 0.0;
+        
+        // 終局時はその場でバックプロパゲーションを実行
+        double v = result;
+        for (int i = path.size() - 1; i >= 0; i--) {
+            UpdateNodeStats(path[i].first, path[i].second, v);
+            v = 1.0 - v; // 視点を反転させながら遡る
+        }
+        return result;
     }
 
-    // 2. 次の手を選択（現在のツリー状態からUCBが最大の手を選ぶ）
+    // 2. 次の手を選択 (UCB最大化)
     int next_index = SelectMaxUcbChild(uct_node[current], game->moves, color, mt);
     int pos = uct_node[current].child[next_index].pos;
     int next_node = uct_node[current].child[next_index].index;
 
+    // 仮想損失の加算：重複探索を防ぐ
+    uct_node[current].child[next_index].virtual_loss.fetch_add(1);
     path.push_back({current, next_index});
 
-    // 3. 次の局面の作成（元の game を汚さないよう常にコピー）
+    // 局面を進める
     game_info_t *next_game = AllocateGame();
     CopyGame(next_game, game);
     if (IsLegal(next_game, pos, color)) {
         PutStone(next_game, pos, color);
     }
+    int next_color = 3 - color;
 
     double v = 0.5;
 
-    // --- 【検証用】深さ1で止めるロジック ---
-    if (next_node == NOT_EXPANDED) {
-        // 未展開：NN評価へ回す
-        uct_node[current].child[next_index].virtual_loss.fetch_add(1);
-
-        // NN入力用テンソル生成
-        at::Tensor input_tensor = TamaGoFeature::GenerateInputPlanes(next_game, 3 - color);
-        
-        // キューに push。これ以降、next_game の所有権は BatchThread(ProcessMiniBatch) に移る。
-        // ※ここでは FreeGame(next_game) は絶対に呼ばない。
-        g_batch_queue.push(input_tensor, next_game, path, 3 - color);
-        
-        v = 0.5; // BatchThread が値を更新するまでの暫定値
-    } 
-    else {
-        // 展開済み：深さ1検証中は再帰せず、既存の統計情報を利用してバックプロパゲーションのテスト
-        if (uct_node[next_node].move_count > 0) {
-            v = 1.0 - (double)uct_node[next_node].win / uct_node[next_node].move_count;
+    // 3. 探索・展開ロジック (tree.py の expand_threshold=1 を再現)
+    // 訪問数が 1 未満、かつ未展開なら NN 評価へ
+    if (uct_node[current].child[next_index].move_count < 1) {
+        if (next_node == NOT_EXPANDED) {
+            at::Tensor input_tensor = TamaGoFeature::GenerateInputPlanes(next_game, next_color);
+            
+            // キューに push。この path に基づき ProcessMiniBatch 内でバックプロパゲーションが行われる
+            g_batch_queue.push(input_tensor, next_game, path, next_color);
+            
+            // NN評価待ちのため暫定値を返す
+            return 0.5; 
         } else {
-            v = 0.5;
+            // インデックスはあるが未訪問（稀なケース）なら再帰
+            v = 1.0 - UctSearch(next_game, next_color, mt, next_node, path);
         }
-
-        // 展開済みの場合は BatchThread に行かないため、ここで確実に解放
-        FreeGame(next_game);
-
-        // 統計情報の更新
-        UpdateNodeStats(current, next_index, v);
+    } else {
+        // 訪問済みであればさらに深く再帰
+        if (next_node != NOT_EXPANDED) {
+            v = 1.0 - UctSearch(next_game, next_color, mt, next_node, path);
+        } else {
+            // 万が一訪問済みで未展開の場合も評価に回す
+            at::Tensor input_tensor = TamaGoFeature::GenerateInputPlanes(next_game, next_color);
+            g_batch_queue.push(input_tensor, next_game, path, next_color);
+            return 0.5;
+        }
     }
+
+    // 探索終了後にメモリ解放
+    FreeGame(next_game);
 
     return v;
 }
