@@ -22,10 +22,14 @@ INCLUDE_DIR = ./include
 
 SOURCES = $(shell find $(SOURCE_DIR) -name '*.cpp')
 
-LIBTORCH_DIR = /mnt/c/Users/amazm/libtorch
+# --- 修正後 ---
+# 1. パスを WSL2 内の Linux 用 LibTorch に変更
+LIBTORCH_DIR = /home/ama/libtorch
 
+# 2. ライブラリ指定に -ltorch_cuda を追加し、cpu を cuda に置き換える
 LIBTORCH_INC = -I$(LIBTORCH_DIR)/include -I$(LIBTORCH_DIR)/include/torch/csrc/api/include
-LIBTORCH_LIB = -L$(LIBTORCH_DIR)/lib -ltorch -ltorch_cpu -lc10 -Wl,-rpath,$(LIBTORCH_DIR)/lib
+# --- 修正後 ---
+LIBTORCH_LIB = -L$(LIBTORCH_DIR)/lib -ltorch -ltorch_cuda -ltorch_cpu -lc10 -Wl,-rpath,$(LIBTORCH_DIR)/lib
 
 INCLUDE += $(LIBTORCH_INC)
 # ABI設定を 1 に（最新のLibTorch用）
@@ -39,6 +43,10 @@ OBJECTS := $(subst .cu,.o,$(OBJECTS))
 DEPENDS = $(OBJECTS:.o=.d)
 
 INCLUDE += -I$(INCLUDE_DIR)
+# --- 修正後 ---
+#CUDA_PATH = /usr/local/cuda
+#INCLUDE += -I$(CUDA_PATH)/include   # ← INCLUDE に変更
+#LDFLAGS += -L$(CUDA_PATH)/lib64 -lcudart # ← リンクエラー防止のためこれも追加推奨
 
 ifeq ($(RELEASE), 1)
 	LDFLAGS += -static -lm -Wl,--whole-archive -lpthread -Wl,--no-whole-archive

@@ -64,8 +64,6 @@ InitializeCandidate( child_node_t &child, int &child_num, const int pos, const b
   child.pw = false;
   child.open = false;
   child.ladder = ladder;
-
-  child_num++;
 }
 
 
