@@ -448,10 +448,6 @@ InitializeUctSearch( void )
   // UCTのノードのメモリを確保
   uct_node = new uct_node_t[uct_hash_size];
 
-  std::cerr << "Require " << uct_hash_size * sizeof(uct_node_t) / 1024 / 1024 << " Mbytes for Uct Node" << std::endl << std::endl;
-  std::cerr << sizeof(uct_node_t) << std::endl;
-  std::cerr << sizeof(child_node_t) * UCT_CHILD_MAX << std::endl;
-  
   if (uct_node == NULL) {
     std::cerr << "Cannot allocate memory !!" << std::endl;
     std::cerr << "You must reduce tree size !!" << std::endl;
@@ -556,7 +552,28 @@ struct SearchMonitor {
         return false;
     }
 };
+/**
+ * @brief NNの推論結果（Value）をルート方向へ報告し、Virtual Lossを解除する
+ */
+// 修正案：探索経路（path）を受け取るように変更する必要があります
+// 共通のバックプロパゲーション関数
+void Backpropagate(std::vector<std::pair<int, int>> &path, double win_rate) {
+    double v = win_rate;
+    // パスを末端（深い方）からルート（浅い方）へ遡る
+    for (int i = (int)path.size() - 1; i >= 0; i--) {
+        int n_idx = path[i].first;
+        int c_idx = path[i].second;
 
+        // 1. 仮想損失を解除 (fetch_addした分を引く)
+        uct_node[n_idx].child[c_idx].virtual_loss.fetch_sub(1);
+
+        // 2. 統計情報を更新 (訪問回数+1、勝利数+v)
+        UpdateNodeStats(n_idx, c_idx, v);
+
+        // 3. 次の親ノード視点では勝敗が逆転するので反転
+        v = 1.0 - v;
+    }
+}
 
 /**
  * @brief 現在の探索木から最善応手系列(PV)を取得する
@@ -621,7 +638,7 @@ UctSearchGenmove(game_info_t *game, int color, int mode)
     ClearUctHash();
 
     int po_limit = 100000;          
-    double time_limit = 6.0;      
+    double time_limit = 10.0;      
     
     SearchMonitor monitor;
     monitor.start_time = std::chrono::system_clock::now();
@@ -1365,19 +1382,12 @@ UctSearch(game_info_t *game, int color, std::mt19937_64 &mt, int current, std::v
         double score = static_cast<double>(CalculateScore(game));
         extern double komi[]; 
         score -= komi[0]; 
-        // 現在の手番(color)から見た勝利判定
         double result = (color == S_BLACK) ? (score > 0 ? 1.0 : 0.0) : (score < 0 ? 1.0 : 0.0);
-        
-        // 終局時はその場でバックプロパゲーション（pathにVLが入っているため解除が必要）
-        double v = result;
-        for (int i = (int)path.size() - 1; i >= 0; i--) {
-            int n_idx = path[i].first;
-            int c_idx = path[i].second;
-            uct_node[n_idx].child[c_idx].virtual_loss.fetch_sub(1); 
-            UpdateNodeStats(n_idx, c_idx, v); 
-            v = 1.0 - v; 
-        }
-        return result;
+
+        // ★追加：終局した結果をルートまで報告する
+        Backpropagate(path, result);
+
+        return result; 
     }
 
     // 2. 次の手を選択
@@ -1415,7 +1425,14 @@ UctSearch(game_info_t *game, int color, std::mt19937_64 &mt, int current, std::v
         return 0.5; // 暫定勝率を返してスレッドを解放
     } else {
         // 展開済み：さらに深く再帰
-        value_result = 1.0 - UctSearch(next_game.get(), next_color, mt, next_node, path);
+        // 子から返ってきた「相手の勝率」を「自分の勝率」に反転
+        double v_from_child = UctSearch(next_game.get(), next_color, mt, next_node, path);
+        value_result = 1.0 - v_from_child;
+
+        // ★ここで統計を更新する（バックプロパゲーションの一環）
+        // virtual_loss を引き、確定した勝率 v_from_child (子の視点) を加算
+        uct_node[current].child[next_index].virtual_loss.fetch_sub(1);
+        UpdateNodeStats(current, next_index, value_result); // 親(自分)の視点での勝ちを加算
     }
 
     return value_result;
@@ -1470,15 +1487,15 @@ SelectMaxUcbChild( uct_node_t &node, const int moves, const int color, std::mt19
     const int total_visits = node.move_count.load();
     // 仮想損失も含めたトータルの分母で計算する
     const double sqrt_total = std::sqrt(static_cast<double>(total_visits) + 1.0);
-    const double C_PUCT = 1.0; 
+    const double C_PUCT = 8.0; 
 
     double parent_q = 0.5;
     if (total_visits > 0) {
+        // 既に手番側の勝率として保存されているなら、色による反転は不要！
         parent_q = static_cast<double>(node.win) / total_visits;
-        if (color == S_WHITE) parent_q = 1.0 - parent_q;
     }
     
-    const double fpu_reduction = 0.0; 
+    const double fpu_reduction = 0.1; 
     double fpu_value = parent_q - fpu_reduction;
     if (fpu_value < 0.0) fpu_value = 0.0;
 
@@ -1982,20 +1999,5 @@ int ExpandNodeWithNN(game_info_t *game, int color, int current, int child_index,
     
     return new_index;
 }
-/**
- * @brief NNの推論結果（Value）をルート方向へ報告し、Virtual Lossを解除する
- */
-// 修正案：探索経路（path）を受け取るように変更する必要があります
-// BackpropagateNNResult の中（BatchHandler側）でVLを解除する例
-void BackpropagateNNResult(std::vector<std::pair<int, int>> &path, double win_rate) {
-    for (auto &p : path) {
-        int n_idx = p.first;
-        int c_idx = p.second;
-        // ここで初めて VL を引く
-        uct_node[n_idx].child[c_idx].virtual_loss.fetch_sub(1);
-        // ここで訪問回数と勝利数を更新する
-        UpdateNodeStats(n_idx, c_idx, win_rate);
-        win_rate = 1.0 - win_rate;
-    }
-}
+
 

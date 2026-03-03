@@ -12,6 +12,9 @@ extern int ExpandNodeWithNN(game_info_t *game, int color, int current, int child
 extern uct_node_t *uct_node;
 extern BatchQueue g_batch_queue;
 
+// UctSearch.cpp で定義されているバックプロパゲーション関数を呼び出せるようにする
+extern void Backpropagate(std::vector<std::pair<int, int>> &path, double win_rate);
+
 /**
  * @brief 勝利数(win)をスレッドセーフに加算する内部関数
  * doubleのAtomic操作をCASループで実現
@@ -66,19 +69,7 @@ void ProcessMiniBatch(torch::jit::script::Module &model, torch::Device &device) 
                       (v_probs[0].item<float>() + v_probs[1].item<float>()*0.5f) : 
                       (v_probs[2].item<float>() + v_probs[1].item<float>()*0.5f);
 
-            // --- 1. バックプロパゲーション ---
-            float current_v = v; 
-            for (int j = (int)item.path.size() - 1; j >= 0; --j) {
-                int node_idx = item.path[j].first;
-                int child_idx = item.path[j].second;
-                child_node_t &child = uct_node[node_idx].child[child_idx];
-
-                child.move_count.fetch_add(1);
-                AddWinCount(child, static_cast<double>(current_v));
-                uct_node[node_idx].move_count.fetch_add(1);
-
-                current_v = 1.0f - current_v;
-            }
+            Backpropagate(item.path, static_cast<double>(v));
 
             // 展開処理
             auto last_step = item.path.back();

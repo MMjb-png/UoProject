@@ -247,9 +247,8 @@ GTP_main( void )
   InitializeBoard(game);
 
   try {
-    tamago_model = torch::jit::load("/mnt/c/Users/amazm/UoProjrct/Ray-11.2.0/tamago_sl_model.pt");
+    tamago_model = torch::jit::load("/mnt/c/Users/amazm/UoProjrct/Ray-11.2.0/tamago_rl_model.pt");
     tamago_model.eval();
-    std::cerr << "TamaGo model loaded successfully!" << std::endl;
   } catch (const c10::Error& e) {
     std::cerr << "Error loading the model: tamago_sl_model.pt" << std::endl;
     // モデルがないと動かない場合はここで exit(1); するか、

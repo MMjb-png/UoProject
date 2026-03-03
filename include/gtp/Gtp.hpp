@@ -40,7 +40,7 @@ constexpr char DELIM[] = " ";
  * @~japanese
  * @brief プログラム名
  */
-constexpr char PROGRAM_NAME[] = "Ray";
+constexpr char PROGRAM_NAME[] = "KZR";
 
 /**
  * @~english
