@@ -15,7 +15,7 @@
 #include "feature/Nakade.hpp"
 #include "feature/Semeai.hpp"
 #include "pattern/Pattern.hpp"
-#include "mcts/UctRating.hpp"
+// #include "mcts/UctRating.hpp"
 
 
 /**

@@ -1,93 +1,87 @@
-#ifndef BATCH_QUEUE_HPP
-#define BATCH_QUEUE_HPP
+#ifndef TAMA_BATCH_QUEUE_HPP
+#define TAMA_BATCH_QUEUE_HPP
 
+#include <torch/torch.h>
 #include <vector>
 #include <mutex>
-#include <condition_variable>
-#include <utility> // std::pair用
-#include <torch/torch.h>
+#include <utility>
 #include "board/GoBoard.hpp"
-#include "board/BoardData.hpp"
 
 /**
- * @brief 推論リクエスト1回分のデータを保持する構造体
+ * @brief 推論待ちの1局面分のデータを保持する構造体
  */
 struct BatchItem {
-    at::Tensor input;
-    game_info_t *game;
-    // これが定義されている必要があります！
-    std::vector<std::pair<int, int>> path; 
+    torch::Tensor input;
+    game_info_t game_copy; // ★ポインタではなく実体
+    std::vector<std::pair<int, int>> path;
     int color;
-};
 
+    // コンストラクタ（引数は4つ）
+    BatchItem(torch::Tensor i, const game_info_t *g, const std::vector<std::pair<int, int>>& p, int c)
+        : input(i), path(p), color(c) {
+        if (g) {
+            game_copy = *g; // ここで中身をコピー（寿命問題を解決）
+        }
+    }
+};
 /**
- * @brief ワーカースレッドとメインスレッド（BatchHandler）を繋ぐキュー
+ * @brief 推論待ちキューを管理するクラス
+ * 複数スレッドからの push と、推論スレッドによる一括取り出し(pop_all)を安全に行います。
  */
 class BatchQueue {
 private:
-    std::vector<BatchItem> queue;
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool is_interrupted;
+    std::vector<BatchItem> queue_items; // キューの実体
+    std::mutex mtx;                     // スレッドセーフのためのミューテックス
 
 public:
-    BatchQueue() : is_interrupted(false) {}
-
+    BatchQueue() = default;
     /**
-     * @brief ワーカースレッドが使用：推論待ちの経路と局面を積む
+     * @brief キューにデータを追加する
+     * @return 追加後のキューのサイズ
      */
-    void push(at::Tensor input, game_info_t *game, const std::vector<std::pair<int, int>>& path, int color) {
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            queue.push_back({input, game, path, color});
+    size_t push(torch::Tensor input, game_info_t *game, const std::vector<std::pair<int, int>>& path, int color) {
+        if (game == nullptr) {
+            std::cerr << "ERROR: game pointer is NULL in push!" << std::endl;
+            return queue_items.size();
         }
-        // メインスレッド（BatchHandler）にデータが入ったことを通知
-        cv.notify_all();
+
+        // BatchItem のコンストラクタに合わせて引数を 4 つで呼び出す
+        queue_items.emplace_back(input, game, path, color);
+
+        std::cerr << "Debug: Inside push - added to queue. size: " << queue_items.size() << std::endl;
+        return queue_items.size();
     }
 
     /**
-     * @brief BatchHandlerが使用：溜まっているリクエストを一括で取り出す
+     * @brief 現在キューに入っているすべてのアイテムを取り出し、キューを空にする
+     * @return 取り出したアイテムのリスト
      */
     std::vector<BatchItem> pop_all() {
-        std::unique_lock<std::mutex> lock(mtx);
-        
-        // データが来るまで最大10ms待機（デッドロック防止）
-        cv.wait_for(lock, std::chrono::milliseconds(10), [this] { 
-            return !queue.empty() || is_interrupted; 
-        });
-        
-        if (queue.empty()) return {};
-
-        std::vector<BatchItem> items = std::move(queue);
-        queue.clear();
-        return items;
+        std::vector<BatchItem> extracted = std::move(queue_items);
+        queue_items.clear();
+        return extracted;
     }
 
     /**
-     * @brief 推論完了を全スレッドに通知する
+     * @brief キューが空かどうかを確認する
      */
-    void notify_completion() {
-        cv.notify_all();
+    bool empty() {
+        return queue_items.empty();
     }
 
     /**
-     * @brief キューのサイズ確認
+     * @brief 現在のキューのサイズを取得する
      */
     size_t size() {
-        std::lock_guard<std::mutex> lock(mtx);
-        return queue.size();
+        return queue_items.size();
     }
 
-    /**
-     * @brief 強制停止（探索終了時にスレッドを解放する）
-     */
-    void interrupt() {
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            is_interrupted = true;
-        }
-        cv.notify_all();
+    void notify_completion() {
+        // ここでは特に何もしませんが、必要に応じて条件変数などで待機スレッドを通知することもできます。
     }
 };
 
-#endif
+// グローバルなバッチキューの宣言（実体は cpp ファイル等で定義）
+extern BatchQueue g_batch_queue;
+
+#endif // TAMA_BATCH_QUEUE_HPP

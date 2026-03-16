@@ -102,7 +102,7 @@ struct child_node_t {
    * @~japanese
    * @brief 子ノードのインデックス
    */
-  int index;
+  std::atomic<int> index;
 
   /**
    * @~english
@@ -137,6 +137,7 @@ struct child_node_t {
   bool ladder;
 
   double nn_policy;
+  
 };
 
 

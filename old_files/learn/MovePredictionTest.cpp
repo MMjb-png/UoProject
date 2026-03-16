@@ -20,8 +20,8 @@
 #include "board/GoBoard.hpp"
 #include "board/Point.hpp"
 #include "sgf/SgfExtractor.hpp"
-#include "mcts/UctRating.hpp"
-#include "mcts/Rating.hpp"
+// #include "mcts/UctRating.hpp"
+// #include "mcts/Rating.hpp"
 #include "util/Utility.hpp"
 
 

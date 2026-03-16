@@ -16,7 +16,7 @@
 #include "board/ZobristHash.hpp"
 #include "feature/Semeai.hpp"
 #include "feature/SimulationFeature.hpp"
-#include "mcts/UctRating.hpp"
+// #include "mcts/UctRating.hpp"
 
 
 /**
@@ -248,6 +248,7 @@ static void InitializeTerritory( void );
 //  盤端での処理
 static bool IsFalseEyeConnection( const game_info_t *game, const int pos, const int color );
 
+#define MOVE_DISTANCE_MAX 200 // 元のコードで定義されていた値
 
 /**
  * @~english

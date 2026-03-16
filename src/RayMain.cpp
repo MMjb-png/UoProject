@@ -6,6 +6,10 @@
  * @~japanese
  * @brief Rayのエントリーポイント
  */
+
+#include <torch/torch.h>
+#include <torch/script.h>
+
 #include <cstring>
 #include <cstdio>
 #if defined (_WIN32)
@@ -20,11 +24,10 @@
 #include "learn/MinorizationMaximization.hpp"
 #include "learn/PatternAnalyzer.hpp"
 #include "pattern/PatternHash.hpp"
-#include "mcts/Rating.hpp"
-#include "mcts/UctRating.hpp"
+// #include "mcts/Rating.hpp"
+// #include "mcts/UctRating.hpp"
 #include "mcts/UctSearch.hpp"
 #include "util/Command.hpp"
-
 
 /**
  * @~english
@@ -38,9 +41,19 @@
  * @param[in] argv コマンドライン引数
  * @return 終了コード
  */
+
+extern torch::Device device;
+
 int
 main( int argc, char **argv )
 {
+
+  if (torch::hasCUDA()) {
+    device = torch::Device(torch::kCUDA);
+  } else {
+    device = torch::Device(torch::kCPU);
+  }
+
   char program_path[1024];
   int last;
 
@@ -74,13 +87,13 @@ main( int argc, char **argv )
 
   // 各種初期化
   InitializeConst();
-  InitializeRating();
-  InitializeUctRating();
+  // InitializeRating();
+  // InitializeUctRating();
   InitializeUctSearch();
   InitializeSearchSetting();
   InitializeHash();
   InitializeUctHash();
-  SetNeighbor();
+  // SetNeighbor();
 
   //AnalyzePattern();
 

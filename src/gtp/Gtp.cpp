@@ -25,14 +25,16 @@
 #include "feature/Nakade.hpp"
 #include "gtp/Gtp.hpp"
 #include "mcts/AnalysisData.hpp"
-#include "mcts/Rating.hpp"
-#include "mcts/Simulation.hpp"
+// #include "mcts/Rating.hpp"
+// #include "mcts/Simulation.hpp"
 #include "mcts/UctSearch.hpp"
-#include "mcts/UctRating.hpp"
+// #include "mcts/UctRating.hpp"
 #include "mcts/MoveSelection.hpp"
 #include "sgf/SgfExtractor.hpp"
 
 torch::jit::script::Module tamago_model;
+
+torch::Device device(torch::kCPU);
 
 /**
  * @~english
@@ -247,12 +249,12 @@ GTP_main( void )
   InitializeBoard(game);
 
   try {
-    tamago_model = torch::jit::load("/mnt/c/Users/amazm/UoProjrct/Ray-11.2.0/tamago_rl_model.pt");
-    tamago_model.eval();
+      tamago_model = torch::jit::load("tamago_sl_model.pt");
+      tamago_model.to(device); // RayMainで定義したdeviceへ
+      tamago_model.eval();
+      std::cerr << "Model loaded successfully." << std::endl;
   } catch (const c10::Error& e) {
-    std::cerr << "Error loading the model: tamago_sl_model.pt" << std::endl;
-    // モデルがないと動かない場合はここで exit(1); するか、
-    // フラグを立ててモデルなしモードで動かす処理が必要です。
+      std::cerr << "Error loading the model: " << e.msg() << std::endl;
   }
 
   while (fgets(input, sizeof(input), stdin) != NULL) {
@@ -350,7 +352,7 @@ GTP_boardsize( void )
       size <= PURE_BOARD_SIZE && size > 0) {
     SetBoardSize(size);
     SetParameter();
-    SetNeighbor();
+    // SetNeighbor();
     InitializeNakadeHash();
   }
 
@@ -617,9 +619,9 @@ GTP_getkomi( void )
   char buf[256];
   
 #if defined(_WIN32)
-  sprintf_s(buf, 4, "%lf", komi[0]);
+  sprintf_s(buf, sizeof(buf), "%lf", komi[0]);
 #else
-  snprintf(buf, 4, "%lf", komi[0]);
+  snprintf(buf, sizeof(buf), "%lf", komi[0]);
 #endif
   GTP_response(buf, true);
 }
@@ -1011,7 +1013,7 @@ GTP_loadsgf( void )
       size <= PURE_BOARD_SIZE && size > 0) {
     SetBoardSize(size);
     SetParameter();
-    SetNeighbor();
+    // SetNeighbor();
     InitializeNakadeHash();
   }
   FreeGame(game);

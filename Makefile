@@ -24,12 +24,12 @@ SOURCES = $(shell find $(SOURCE_DIR) -name '*.cpp')
 
 # --- 修正後 ---
 # 1. パスを WSL2 内の Linux 用 LibTorch に変更
-LIBTORCH_DIR = /home/ama/libtorch
+LIBTORCH_DIR = ./libtorch
 
 # 2. ライブラリ指定に -ltorch_cuda を追加し、cpu を cuda に置き換える
 LIBTORCH_INC = -I$(LIBTORCH_DIR)/include -I$(LIBTORCH_DIR)/include/torch/csrc/api/include
 # --- 修正後 ---
-LIBTORCH_LIB = -L$(LIBTORCH_DIR)/lib -ltorch -ltorch_cuda -ltorch_cpu -lc10 -Wl,-rpath,$(LIBTORCH_DIR)/lib
+LIBTORCH_LIB = -L$(LIBTORCH_DIR)/lib -ltorch -ltorch_cpu -lc10 -Wl,-rpath,$(LIBTORCH_DIR)/lib
 
 INCLUDE += $(LIBTORCH_INC)
 # ABI設定を 1 に（最新のLibTorch用）
